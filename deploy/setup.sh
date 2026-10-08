@@ -14,6 +14,12 @@
 #           2) 在该目录里执行: sudo bash deploy/setup.sh
 #         脚本是幂等的(可重复执行), 已装好的服务会跳过或安全地重启。
 #
+#   日期: 2026-10-07 (追加)
+#   内容: 新增 IPv6 反向代理功能的部署支持(第7步):
+#         安装 certbot、创建 Nginx stream 挂载目录并在 nginx.conf 注入
+#         stream{} 块、建证书目录、给 root 装"每分钟应用代理配置"的 cron。
+#         这样部署到新公网 VPS 时, IPv6 代理功能开箱即用, 无需手动配置。
+#
 # 用法:
 #   sudo bash deploy/setup.sh [网站根目录] [访问地址]
 #   例1(内网, 用默认值):  sudo bash deploy/setup.sh
@@ -60,15 +66,16 @@ fi
 # 说明: 这些是"运行环境", 全新 VPS 上什么都没有, 必须先装。
 # 如果已安装, apt 会直接跳过, 不会重复安装。
 export DEBIAN_FRONTEND=noninteractive
-echo "[1/7] 安装运行环境(apt, 可能需要几分钟)..."
+echo "[1/8] 安装运行环境(apt, 可能需要几分钟)..."
 apt-get update -y
 apt-get install -y nginx php8.1-fpm php8.1-cli \
-    php8.1-gd php8.1-curl php8.1-mbstring php8.1-xml php8.1-zip php8.1-bcmath
+    php8.1-gd php8.1-curl php8.1-mbstring php8.1-xml php8.1-zip php8.1-bcmath \
+    certbot
 
 # ---------- 2. 设置系统时区为上海 ----------
 # 说明: 【关键】cron 定时任务按"系统时间"触发。若系统是 UTC, 脚本里的
 # "凌晨3:17"实际会跑在北京时间 11:17, 删除日期也会差一天。必须对齐。
-echo "[2/7] 设置系统时区 Asia/Shanghai..."
+echo "[2/8] 设置系统时区 Asia/Shanghai..."
 timedatectl set-timezone Asia/Shanghai
 
 # ---------- 3. 把项目代码放到网站根目录 ----------
@@ -78,7 +85,7 @@ timedatectl set-timezone Asia/Shanghai
 #   正是这种情况 —— 一旦加上, 每次重新部署都会清空你所有的图片! 绝对不要加。
 #   不加 --delete 的代价只是升级后可能残留旧文件, 远比重删图片安全。
 # 排除项: .git/docs/deploy 是开发用的, 不需要出现在生产服务器上。
-echo "[3/7] 同步代码到 $WEBROOT ..."
+echo "[3/8] 同步代码到 $WEBROOT ..."
 mkdir -p "$WEBROOT"
 apt-get install -y rsync >/dev/null 2>&1 || true
 if [ "$PROJECT_DIR" != "$WEBROOT" ]; then
@@ -92,7 +99,7 @@ fi
 #   domain/imgurl 写成该地址 —— 哪怕代码里带着上一台机器的旧地址。
 # 场景B 重复部署同一台机器: 不传参数时, 只在 config 仍是出厂默认 127.0.0.1
 #   才替换, 否则保留现有值 —— 这样你在后台改过的设置永远不会被脚本抹掉。
-echo "[4/7] 初始化 config.php..."
+echo "[4/8] 初始化 config.php..."
 CFG="$WEBROOT/config/config.php"
 if [ -n "${2:-}" ]; then
     # 场景A: 用户显式指定了访问地址
@@ -121,7 +128,7 @@ touch "$WEBROOT/config/install.lock"
 
 # ---------- 5. 安装 Nginx 站点配置 ----------
 # 说明: 用模板文件替换占位符后写入, 并删除 Ubuntu 自带的默认站点。
-echo "[5/7] 配置 Nginx 站点..."
+echo "[5/8] 配置 Nginx 站点..."
 sed "s#__WEBROOT__#$WEBROOT#g" "$SCRIPT_DIR/nginx-easyimage.conf" \
     > /etc/nginx/sites-available/easyimage
 ln -sf /etc/nginx/sites-available/easyimage /etc/nginx/sites-enabled/easyimage
@@ -130,15 +137,61 @@ nginx -t   # 语法检查, 不通过则脚本因 set -e 停止
 
 # ---------- 6. 调大 PHP 上传限制 ----------
 # 说明: PHP 默认只允许上传 2M, 图床默认单文件 10M, 不改会上传失败。
-echo "[6/7] 调整 PHP 上传限制..."
+echo "[6/8] 调整 PHP 上传限制..."
 PHPINI="/etc/php/8.1/fpm/php.ini"
 sed -i 's|^upload_max_filesize.*|upload_max_filesize = 100M|' "$PHPINI"
 sed -i 's|^post_max_size.*|post_max_size = 100M|' "$PHPINI"
 sed -i 's|^max_execution_time.*|max_execution_time = 300|' "$PHPINI"
 sed -i 's|^memory_limit.*|memory_limit = 256M|' "$PHPINI"
 
-# ---------- 7. 设置权限 + 安装 crontab 定时删除 ----------
-echo "[7/7] 设置权限并安装定时任务..."
+# ---------- 7. IPv6 反向代理基础设施 ----------
+# 说明: 后台"IPv6代理"功能依赖三样东西, 都在这里一次性装好:
+#   a) Nginx stream 模块的挂载目录 + nginx.conf 里的 stream{} 块
+#      (Ubuntu 的 nginx 完整版自带 ngx_stream_core_module, 但默认没有
+#       stream{} 配置块, 需要我们补上 include 入口)
+#   b) certbot 证书验证目录 /var/www/certbot(签发/续期证书用)
+#   c) root 用户的 cron: 每分钟跑 proxy_apply.php 应用器
+#      【为什么是 root 而不是 www-data】应用器要写 /etc/nginx 并 reload,
+#      这些只有 root 能做; 而 Web 进程(www-data)只留"改规则+打标记"的
+#      低权限操作, 被攻破也碰不到系统 —— 这是本功能的安全边界。
+echo "[7/8] 初始化 IPv6 代理基础设施..."
+
+# a) stream 挂载目录
+mkdir -p /etc/nginx/stream.d
+
+# 只在 nginx.conf 还没有 stream{} 块时才注入(幂等, 重复跑不会叠加)
+if ! grep -q '^stream {' /etc/nginx/nginx.conf; then
+    # 在 http{} 块所在文件的末尾追加 stream{} 块。
+    # sed 的 a\ 在最后一行后追加多行文本。
+    cat >> /etc/nginx/nginx.conf <<'STREAM_BLOCK'
+
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+STREAM_BLOCK
+    echo "  已向 nginx.conf 追加 stream{} 块"
+else
+    echo "  nginx.conf 已有 stream{} 块, 跳过"
+fi
+
+# b) certbot webroot 目录(与站点模板里 /.well-known 的 root 一致)
+mkdir -p /var/www/certbot
+chown -R www-data:www-data /var/www/certbot
+
+# 代理证书存放目录(root 专属, www-data 不可读, 私钥更安全)
+mkdir -p /etc/nginx/proxy_certs
+
+# c) root cron: 每分钟检查"待应用"标记并应用代理配置
+# 注意: 应用器没有标记时直接退出, 所以每分钟跑一次的开销≈0, 放心。
+APPLY_CRON="* * * * * /usr/bin/php $WEBROOT/proxy_apply.php >> $WEBROOT/admin/logs/tasks/proxy_apply_cron.log 2>&1"
+# 用"先删旧行再加新行"的方式合并进 root 的 crontab, 保证幂等且不覆盖其他任务
+( crontab -u root -l 2>/dev/null | grep -v 'proxy_apply.php' ; echo "$APPLY_CRON" ) | crontab -u root -
+echo "  已安装 root crontab: 每分钟应用 IPv6 代理配置"
+
+nginx -t   # stream{} 注入后再验一次语法
+
+# ---------- 8. 设置权限 + 安装 crontab 定时删除 ----------
+echo "[8/8] 设置权限并安装定时任务..."
 # 整个网站归 www-data(Nginx/PHP 的运行用户), 否则 PHP 无法写图片
 chown -R www-data:www-data "$WEBROOT"
 chmod -R 755 "$WEBROOT"
@@ -163,13 +216,16 @@ echo "==================== 部署完成, 自检 ===================="
 echo "Nginx 状态 : $(systemctl is-active nginx)"
 echo "PHP-FPM    : $(systemctl is-active php8.1-fpm)"
 echo "系统时区   : $(timedatectl | grep -oP 'Time zone:\s*\K.*')"
-echo "定时任务   : $(crontab -u www-data -l | head -1)"
+echo "定时删除   : $(crontab -u www-data -l | head -1)"
+echo "代理应用器 : $(crontab -u root -l | grep -c proxy_apply) 条 root cron"
+echo "stream模块 : $(nginx -V 2>&1 | grep -o with-stream | head -1)"
 echo "本机访问   : $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/)"
 echo "========================================================"
 echo "访问地址: $SITE_URL"
 echo "后台地址: $SITE_URL/admin/index.php"
 echo ""
 echo "下一步必做:"
-echo "  1. 用默认账号 admin / 默认密码 admin@123 登录后台"
-echo "  2. 立即在后台修改密码(默认密码有泄露风险, 后台也会弹红字提醒)"
+echo "  1. 账号 admin, 密码沿用 config.php 里已设置的密码(本地改好后随代码一起部署)"
+echo "  2. 若密码仍是出厂默认 admin@123, 请立即登录后台修改(有泄露风险, 后台会弹红字提醒)"
 echo "  3. 如需 HTTPS, 可安装 certbot 为 $SITE_URL 申请证书"
+echo "  4. IPv6 反向代理: 登录后台顶部菜单「IPv6代理」添加规则(需先配好域名解析)"

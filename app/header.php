@@ -45,6 +45,9 @@
 				<?php /** 非管理不显示设置 */ if (is_who_login('admin')) : ?>
 					<li><a href="<?php echo $config['domain']; ?>/admin/admin.inc.php"><i class="icon icon-cogs"></i> 设置</a></li>
 				<?php endif; ?>
+				<?php /** IPv6反向代理: 仅管理员可见 */ if (is_who_login('admin')) : ?>
+					<li><a href="<?php echo $config['domain']; ?>/admin/proxy.php"><i class="icon icon-sitemap"></i> IPv6代理</a></li>
+				<?php endif; ?>
 				<?php /** 非管理或未开启不显示统计 */ if ($config['chart_on'] && is_who_login('admin')) : ?>
 					<li><a href="<?php echo $config['domain']; ?>/admin/chart.php"><i class="icon icon-pie-chart"></i> 统计</a></li>
 				<?php endif; ?>
